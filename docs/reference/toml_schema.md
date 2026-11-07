@@ -56,6 +56,7 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 | `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. |
 | `responses_reasoning` | No | `"auto"` | Responses reasoning replay: `"auto"`, `"preserve_encrypted"`, `"preserve_plaintext"`, or `"drop"`. Only valid for `openai_responses`. |
 | `fallback_on_rate_limit` | No | `true` | Try another completion candidate after an upstream HTTP 429 exhausts retries. Set to `false` to return the 429 instead. |
+| `rate_limit_as_unavailable` | No | `false` | Serve an upstream HTTP 429 that exhausts retries as HTTP 503, keeping the provider's message and code, for clients that retry 5xx but end their session on a 429 (Codex). The 429 still counts as a rate limit for `fallback_on_rate_limit` and the cooldown. |
 | `max_retries` | No | `2` | Retry budget, `0`–`20`. |
 | `retry_backoff_max_ms` | No | `2000` | Longest wait between two retries when the upstream sends no `Retry-After`; the backoff doubles from 250 ms up to this cap. `250`–`60000`. |
 | `failure_cooldown_ms` | No | `5000` (5 seconds) | Skip a backend for this many milliseconds after an exhausted transient completion failure. Zero disables it. |

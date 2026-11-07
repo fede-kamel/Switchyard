@@ -808,7 +808,8 @@ fn random_state_with_retries(
         reasoning_effort: None,
         max_retries,
         failure_cooldown: std::time::Duration::ZERO,
-        retry_backoff_max: Duration::from_secs(2),
+        retry_backoff_max: std::time::Duration::from_secs(2),
+        rate_limit_as_unavailable: false,
         timeout: None,
     });
     let target_models = routes

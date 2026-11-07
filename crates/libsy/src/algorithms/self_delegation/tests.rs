@@ -295,7 +295,10 @@ async fn local_reply_is_served_unchanged() -> Result<()> {
     assert!(attempt["latency_ms"].is_u64());
     assert!(attempt["error"].is_null());
     assert!(attempt["collection_valid"].is_null());
-    assert!(attempt["reasoning"].is_null(), "no reasoning block, no reasoning field");
+    assert!(
+        attempt["reasoning"].is_null(),
+        "no reasoning block, no reasoning field"
+    );
     assert!(record["strong"].is_null());
     assert_eq!(record["served"]["by"], "student");
     assert_eq!(record["served"]["content"], text);
@@ -1022,7 +1025,13 @@ async fn the_trace_records_the_student_reasoning_apart_from_the_content() -> Res
     );
     let fake = Fake::new(vec![Ok(agg)], vec![]);
 
-    let (_, served) = drive(trace.config(), request(), RuntimeModels::new(models(true)), &fake).await?;
+    let (_, served) = drive(
+        trace.config(),
+        request(),
+        RuntimeModels::new(models(true)),
+        &fake,
+    )
+    .await?;
 
     assert!(has_text_block(&served), "the reply is served with its text");
     let attempt = &trace.record()["student"]["attempts"][0];

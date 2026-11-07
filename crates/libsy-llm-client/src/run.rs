@@ -346,9 +346,7 @@ async fn call_first_available<'a>(
             Err(error) if index + 1 == models.len() => return Err(error),
             Err(error)
                 if clients.rate_limit_fallback_disabled.contains(target)
-                    && matches!(&error, LibsyError::ClientCall {
-                        source: LlmClientError::UpstreamHttp { status, .. }, ..
-                    } if *status == StatusCode::TOO_MANY_REQUESTS) =>
+                    && matches!(&error, LibsyError::ClientCall { source, .. } if is_rate_limit(source)) =>
             {
                 return Err(error);
             }
@@ -524,6 +522,15 @@ async fn buffer_routing_stream(
     Ok((stream::iter(events.into_iter().map(Ok)).boxed(), usage))
 }
 
+/// An upstream rate limit that outlived the client's retries, however the backend reports it.
+fn is_rate_limit(error: &LlmClientError) -> bool {
+    match error {
+        LlmClientError::RateLimitExhausted { .. } => true,
+        LlmClientError::UpstreamHttp { status, .. } => *status == StatusCode::TOO_MANY_REQUESTS,
+        _ => false,
+    }
+}
+
 /// Whether a failed candidate is worth routing around.
 fn fallback_reason(
     error: &LibsyError,
@@ -534,9 +541,9 @@ fn fallback_reason(
     };
     match source {
         LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
-        LlmClientError::Transport { .. } | LlmClientError::TemporarilyUnavailable => {
-            Some(RoutingFallbackReason::Unavailable)
-        }
+        LlmClientError::Transport { .. }
+        | LlmClientError::TemporarilyUnavailable
+        | LlmClientError::RateLimitExhausted { .. } => Some(RoutingFallbackReason::Unavailable),
         LlmClientError::UpstreamHttp { status, body } => {
             let policy_denial = serde_json::from_str::<Value>(body).is_ok_and(|value| {
                 value["error"]["code"].as_str() == Some("content_policy_violation")
@@ -1810,7 +1817,8 @@ mod tests {
                         reasoning_effort: None,
                         max_retries: 0,
                         failure_cooldown: std::time::Duration::ZERO,
-                        retry_backoff_max: Duration::from_secs(2),
+                        retry_backoff_max: std::time::Duration::from_secs(2),
+                        rate_limit_as_unavailable: false,
                         timeout: None,
                     };
                     let backend = if responses {
@@ -1958,7 +1966,8 @@ mod tests {
                     reasoning_effort: None,
                     max_retries: 0,
                     failure_cooldown: std::time::Duration::ZERO,
-                    retry_backoff_max: Duration::from_secs(2),
+                    retry_backoff_max: std::time::Duration::from_secs(2),
+                    rate_limit_as_unavailable: false,
                     timeout: None,
                 }),
                 None,
@@ -2719,7 +2728,8 @@ mod tests {
                     reasoning_effort: None,
                     max_retries: 2,
                     failure_cooldown: cooldown,
-                    retry_backoff_max: Duration::from_secs(2),
+                    retry_backoff_max: std::time::Duration::from_secs(2),
+                    rate_limit_as_unavailable: false,
                     timeout: None,
                 })
             };
@@ -2793,7 +2803,8 @@ mod tests {
                 reasoning_effort: None,
                 max_retries: 0,
                 failure_cooldown: std::time::Duration::ZERO,
-                retry_backoff_max: Duration::from_secs(2),
+                retry_backoff_max: std::time::Duration::from_secs(2),
+                rate_limit_as_unavailable: false,
                 timeout: None,
             })
         };
@@ -2894,7 +2905,8 @@ mod tests {
                 reasoning_effort: None,
                 max_retries: 0,
                 failure_cooldown: std::time::Duration::ZERO,
-                retry_backoff_max: Duration::from_secs(2),
+                retry_backoff_max: std::time::Duration::from_secs(2),
+                rate_limit_as_unavailable: false,
                 timeout: None,
             })
         };

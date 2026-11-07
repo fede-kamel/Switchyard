@@ -13,6 +13,12 @@ schema_version = 1
 format = "openai_chat"
 base_url = "https://inference-api.nvidia.com/v1"
 api_key_env = "NVIDIA_API_KEY"
+# A shared pool refuses with 429 + Retry-After 60 for minutes at a time; each retry waits the
+# Retry-After, so the budget is the time a call may wait. No cooldown: one exhausted call must not
+# fail every other session's next call. Codex ends its session on a 429 but retries a 503.
+max_retries = 20
+failure_cooldown_ms = 0
+rate_limit_as_unavailable = true
 
 [targets.teacher]
 id = "nvidia/moonshotai/kimi-k3"

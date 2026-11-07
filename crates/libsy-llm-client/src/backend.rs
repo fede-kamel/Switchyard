@@ -88,6 +88,9 @@ pub struct HttpBackendConfig {
     /// doubles from 250 ms up to this cap. Two seconds keeps the historical behaviour; a
     /// shared endpoint whose capacity bursts last a minute needs a longer cap.
     pub retry_backoff_max: Duration,
+    /// Report an HTTP 429 that exhausts the retry budget as `RateLimitExhausted`, which the server
+    /// serves as HTTP 503. Clients such as Codex retry 5xx but end their session on a 429.
+    pub rate_limit_as_unavailable: bool,
     /// Deadline for one complete response, including retries, retry delays, and stream reads.
     /// `None` leaves the wait unbounded.
     pub timeout: Option<Duration>,
@@ -105,6 +108,8 @@ impl fmt::Debug for HttpBackendConfig {
             .field("reasoning_effort", &self.reasoning_effort)
             .field("max_retries", &self.max_retries)
             .field("failure_cooldown", &self.failure_cooldown)
+            .field("retry_backoff_max", &self.retry_backoff_max)
+            .field("rate_limit_as_unavailable", &self.rate_limit_as_unavailable)
             .field("timeout", &self.timeout)
             .finish()
     }
@@ -350,6 +355,11 @@ impl Backend {
         self.config().retry_backoff_max
     }
 
+    /// Whether an HTTP 429 that exhausts the retry budget is reported as a temporary unavailability.
+    pub fn rate_limit_as_unavailable(&self) -> bool {
+        self.config().rate_limit_as_unavailable
+    }
+
     /// Deadline for all attempts and the complete response; `None` leaves the wait unbounded.
     pub fn timeout(&self) -> Option<Duration> {
         self.config().timeout
@@ -472,6 +482,7 @@ mod tests {
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
             retry_backoff_max: Duration::from_secs(2),
+            rate_limit_as_unavailable: false,
             timeout: None,
         }
     }

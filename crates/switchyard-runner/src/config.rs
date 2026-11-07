@@ -1299,6 +1299,11 @@ struct LlmClientConfig {
     /// doubles from 250 ms up to it. Defaults to 2000; at most 60000.
     #[serde(default = "default_retry_backoff_max_ms")]
     retry_backoff_max_ms: u64,
+    /// Serve an upstream HTTP 429 that exhausts the retries as HTTP 503, for clients that retry 5xx
+    /// but end their session on a 429 (Codex). The 429 still counts as a rate limit for
+    /// `fallback_on_rate_limit` and the cooldown. Defaults to false: the 429 is returned.
+    #[serde(default)]
+    rate_limit_as_unavailable: bool,
     /// Deadline in milliseconds for all attempts and the complete response. Unset is unbounded.
     timeout_ms: Option<u64>,
     responses_reasoning: Option<ResponsesReasoningPolicy>,
@@ -1423,6 +1428,7 @@ fn build_backend(
         max_retries: config.max_retries,
         failure_cooldown: Duration::from_millis(config.failure_cooldown_ms),
         retry_backoff_max: Duration::from_millis(config.retry_backoff_max_ms),
+        rate_limit_as_unavailable: config.rate_limit_as_unavailable,
         timeout: config.timeout_ms.map(Duration::from_millis),
     };
     let backend = match config.format {
@@ -3481,10 +3487,37 @@ target = "azure"
                 &format!("base_url = \"https://example.test/v1\"\nretry_backoff_max_ms = {value}"),
                 1,
             );
-            assert!(error_message(&invalid).contains(
-                "llm client primary retry_backoff_max_ms must be between 250 and 60000"
-            ));
+            assert!(
+                error_message(&invalid).contains(
+                    "llm client primary retry_backoff_max_ms must be between 250 and 60000"
+                )
+            );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn rate_limit_as_unavailable_is_off_unless_set() -> RunnerResult<()> {
+        let default: DeploymentConfig = toml::from_str(VALID_CONFIG).map_err(|error| {
+            RunnerError::configuration(format!("failed to parse default config: {error}"))
+        })?;
+        let Some(primary) = default.llm_clients.get("primary") else {
+            return Err(RunnerError::configuration("primary llm client is missing"));
+        };
+        assert!(!primary.rate_limit_as_unavailable);
+
+        let enabled = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test/v1\"",
+            "base_url = \"https://example.test/v1\"\nrate_limit_as_unavailable = true",
+            1,
+        );
+        let config: DeploymentConfig = toml::from_str(&enabled).map_err(|error| {
+            RunnerError::configuration(format!("failed to parse rate-limit config: {error}"))
+        })?;
+        let Some(primary) = config.llm_clients.get("primary") else {
+            return Err(RunnerError::configuration("primary llm client is missing"));
+        };
+        assert!(primary.rate_limit_as_unavailable);
         Ok(())
     }
 

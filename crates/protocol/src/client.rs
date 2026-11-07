@@ -97,6 +97,14 @@ pub enum LlmClientError {
         body: String,
     },
 
+    /// The upstream answered HTTP 429 for the whole retry budget and the backend reports that as a
+    /// temporary unavailability (HTTP 503), for clients that retry 5xx but not 429.
+    #[error("upstream rate limit exhausted the retry budget (HTTP 429, served as 503): {body}")]
+    RateLimitExhausted {
+        /// Raw upstream error body of the final 429.
+        body: String,
+    },
+
     /// The upstream returned a response the client could not decode.
     #[error("invalid upstream response: {source}")]
     InvalidResponse {

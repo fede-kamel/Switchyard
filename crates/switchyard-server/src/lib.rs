@@ -1402,6 +1402,13 @@ fn client_error(error: &LlmClientError) -> Response {
             "temporarily_unavailable",
         ),
         LlmClientError::UpstreamHttp { status, body } => upstream_error(*status, body),
+        // Served as 503 on purpose (llm client `rate_limit_as_unavailable`): Codex retries 5xx but
+        // ends its session on a 429. The provider's message and code stay in the body.
+        LlmClientError::RateLimitExhausted { body } => upstream_error_as(
+            StatusCode::SERVICE_UNAVAILABLE,
+            body,
+            "upstream_error (HTTP 429 served as 503)".to_string(),
+        ),
         LlmClientError::Transport { source } | LlmClientError::InvalidResponse { source } => {
             error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1427,8 +1434,13 @@ fn client_error(error: &LlmClientError) -> Response {
     }
 }
 
-// Keep the provider's message and nonempty string code in our error JSON.
 fn upstream_error(status: StatusCode, body: &str) -> Response {
+    upstream_error_as(status, body, format!("upstream_error (HTTP {status})"))
+}
+
+// Keep the provider's message and nonempty string code in our error JSON; `log_error` is the
+// fixed text the request log records instead of them.
+fn upstream_error_as(status: StatusCode, body: &str, log_error: String) -> Response {
     let parsed = serde_json::from_str::<Value>(body).unwrap_or_default();
     let error = &parsed["error"];
     let message = error["message"].as_str().unwrap_or(body);
@@ -1438,9 +1450,7 @@ fn upstream_error(status: StatusCode, body: &str) -> Response {
         .unwrap_or("upstream_error");
     let mut response = error_response(status, message, "upstream_error", code);
     // Provider messages and codes can quote request content; log only fixed metadata.
-    response
-        .extensions_mut()
-        .insert(RequestLogError(format!("upstream_error (HTTP {status})")));
+    response.extensions_mut().insert(RequestLogError(log_error));
     response
 }
 
@@ -2302,6 +2312,35 @@ target = "judge"
                 .get::<RequestLogError>()
                 .map(|error| error.0.as_str()),
             Some("invalid request")
+        );
+    }
+
+    // An exhausted rate-limit budget reported by the client (`rate_limit_as_unavailable`) is
+    // served as 503 with the provider's message, and the request log names the real status.
+    #[test]
+    fn exhausted_rate_limit_is_served_as_unavailable() {
+        let error = LlmClientError::RateLimitExhausted {
+            body: r#"{"error":{"message":"Model capacity reached","code":"rate_limit_exceeded"}}"#
+                .to_string(),
+        };
+        let response = client_error(&error);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let log_error = response
+            .extensions()
+            .get::<RequestLogError>()
+            .expect("request log error");
+        assert!(
+            log_error.0.contains("HTTP 429 served as 503"),
+            "{}",
+            log_error.0
+        );
+        let rendered = render_error_response(response, WireFormat::OpenAiChat);
+        let api_error = rendered.extensions().get::<ApiError>().expect("api error");
+        assert_eq!(api_error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            api_error.message.contains("Model capacity reached"),
+            "{}",
+            api_error.message
         );
     }
 

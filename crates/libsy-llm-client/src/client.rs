@@ -427,7 +427,18 @@ impl TranslatingLlmClient {
             until.fetch_max(deadline, Ordering::Relaxed);
         }
         // Let cooldown expire naturally; a successful in-flight call may overlap a newer failure.
-        result
+        // A 429 that outlived the retry budget is still a rate limit for cooldown and fallback
+        // purposes (above and in the runner); only the error the caller sees changes here, for
+        // clients that retry 5xx but end their session on a 429 (Codex).
+        match result {
+            Err(LlmClientError::UpstreamHttp { status, body })
+                if status == StatusCode::TOO_MANY_REQUESTS
+                    && backend.rate_limit_as_unavailable() =>
+            {
+                Err(LlmClientError::RateLimitExhausted { body })
+            }
+            other => other,
+        }
     }
 
     // Sends the encoded body, retrying retryable failures within the backend's retry budget.
@@ -1024,7 +1035,11 @@ fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
     Some(delay.min(MAX_RETRY_AFTER))
 }
 
-fn retry_delay(retry_number: u64, retry_after: Option<Duration>, backoff_max: Duration) -> Duration {
+fn retry_delay(
+    retry_number: u64,
+    retry_after: Option<Duration>,
+    backoff_max: Duration,
+) -> Duration {
     // Retry-After wins; otherwise double 250 ms up to the backend's cap (two seconds by default).
     retry_after.unwrap_or_else(|| {
         let multiplier = 1_u32 << retry_number.min(8);
@@ -1691,6 +1706,7 @@ mod tests {
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
             retry_backoff_max: Duration::from_secs(2),
+            rate_limit_as_unavailable: false,
             timeout: None,
         }
     }
@@ -3362,6 +3378,52 @@ mod tests {
                         })
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    // Codex retries 5xx but ends its session on a 429; a backend can report an exhausted
+    // rate-limit budget as `RateLimitExhausted` (served as 503) while keeping the provider's body.
+    #[tokio::test]
+    async fn exhausted_rate_limit_is_reported_as_unavailable_when_configured()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        for as_unavailable in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(429)
+                        .insert_header("retry-after", "0")
+                        .set_body_string(r#"{"error":{"message":"Model capacity reached"}}"#),
+                )
+                .expect(2)
+                .mount(&server)
+                .await;
+            let backend = HttpBackendConfig {
+                rate_limit_as_unavailable: as_unavailable,
+                ..config_with_retries(&format!("{}/v1", server.uri()), 1)
+            };
+            let client = TranslatingLlmClient::new(&[ModelConfig::new(
+                "gpt",
+                Backend::OpenAiChat(backend),
+                None,
+            )])?;
+            let result = client
+                .call_rewrite_model(request_with_headers("gpt", http::HeaderMap::new()), None)
+                .await;
+            if as_unavailable {
+                let Err(LlmClientError::RateLimitExhausted { body }) = result else {
+                    panic!("expected RateLimitExhausted");
+                };
+                assert!(body.contains("Model capacity reached"), "{body}");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(LlmClientError::UpstreamHttp {
+                        status: StatusCode::TOO_MANY_REQUESTS,
+                        ..
+                    })
+                ));
             }
         }
         Ok(())
