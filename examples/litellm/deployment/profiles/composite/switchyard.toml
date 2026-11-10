@@ -1,0 +1,18 @@
+algorithm = "composite"
+
+# Fresh tasks: the judge forecasts whether the efficient tier can do them.
+[classifier]
+judge_model = "switchyard-judge"
+base_threshold = 0.5
+threshold_step = 0.1
+max_output_tokens = 512
+judge_timeout_seconds = 60
+# The packaged capability card describes a coding agent with tools. Set `prompt`
+# to describe the efficient model you actually deploy; see the README.
+
+# Continuing agent turns: tool results decide, no judge call.
+[stage]
+picker = "efficient_first"
+confidence_threshold = 0.5
+recent_window = 6
+escalation_note = "The efficient tier hit errors; continue from its work."

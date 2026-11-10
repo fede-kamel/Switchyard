@@ -4,6 +4,7 @@
 """Candidate-bound Switchyard routing plugins for LiteLLM."""
 
 from .classifier_routing_plugin import ClassifierRoutingPlugin
+from .composite_routing_plugin import CompositeRoutingPlugin
 from .judge import JudgeClient, LiteLLMJudge, is_judge_call, serving_judge_call
 from .random_routing_plugin import RandomRoutingPlugin
 from .stage_routing_plugin import StageRoutingPlugin
@@ -11,6 +12,7 @@ from .switchyard_routing_plugin import SwitchyardRoutingPlugin
 
 __all__ = [
     "ClassifierRoutingPlugin",
+    "CompositeRoutingPlugin",
     "JudgeClient",
     "LiteLLMJudge",
     "RandomRoutingPlugin",

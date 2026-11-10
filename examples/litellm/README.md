@@ -33,7 +33,9 @@ litellm/
 │   ├── compose.yaml
 │   └── profiles/
 │       ├── stage/{litellm.yaml,switchyard.toml}
-│       └── random/{litellm.yaml,switchyard.toml}
+│       ├── random/{litellm.yaml,switchyard.toml}
+│       ├── classifier/{litellm.yaml,switchyard.toml}
+│       └── composite/{litellm.yaml,switchyard.toml}
 ├── examples/python_router.py
 ├── src/switchyard_litellm/
 │   ├── configuration/
@@ -277,6 +279,43 @@ plugin is installed in (the proxy's router in the proxy) and is flagged in-proce
 pass it through. The packaged capability card describes a coding agent with tools and a harness;
 against a plain text model it tends to rate every task as supported, so set `prompt` to describe
 the efficient model you actually deploy.
+
+### Composite fields
+
+```toml
+algorithm = "composite"
+
+[classifier]
+judge_model = "switchyard-judge"
+base_threshold = 0.5
+threshold_step = 0.1
+max_output_tokens = 512
+
+[stage]
+picker = "efficient_first"
+confidence_threshold = 0.5
+recent_window = 6
+escalation_note = "The efficient tier hit errors; continue from its work."
+```
+
+| Field | Required | Accepted value |
+|---|---:|---|
+| `algorithm` | yes | `"composite"` |
+| `[classifier]` | yes | the classifier's fields above, without `algorithm` |
+| `[stage]` | yes | Stage's fields above, without `algorithm` |
+
+The composite picks per request: a conversation that already carries tool calls or tool results
+goes to Stage, whose execution-aware signal (failing tool results escalate, routine progress stays
+efficient) is better than any judge; a fresh task with nothing but the user's words goes to the
+classifier. Both share the two-candidate contract. A request with any other candidate pool (the
+judge's own group, a single fixed model) passes through unchanged, so one plugin object can be
+installed on a proxy that also serves those groups. The signal's `algorithm` says which one
+decided, the proxy's log gets one `switchyard decision` line per request (logger
+`switchyard_litellm.decisions`), and the response carries the same decision as a header:
+
+```text
+x-switchyard-decision: {"algorithm":"stage_router","selected":"provider/capable","fallbacks":["provider/efficient"],"evidence":{"source":"override"}}
+```
 
 Static errors—missing files, malformed TOML, unknown keys, wrong types, invalid ranges, and invalid
 weight values—fail while LiteLLM imports the plugin at proxy startup. Constraints that depend on

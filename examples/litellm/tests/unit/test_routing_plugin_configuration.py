@@ -7,6 +7,11 @@ from typing import Any
 import pytest
 from litellm.types.router import RoutingContext
 from switchyard_litellm.configuration import load_routing_plugin
+from switchyard_litellm.plugins import (
+    ClassifierRoutingPlugin,
+    CompositeRoutingPlugin,
+    StageRoutingPlugin,
+)
 
 
 def routing_context(
@@ -246,3 +251,59 @@ def test_wraps_malformed_toml_with_its_path(tmp_path: Path) -> None:
         load_routing_plugin(config_path)
 
     assert str(config_path) in str(error.value)
+
+
+async def test_loads_composite_classifier_and_stage_tables(tmp_path: Path) -> None:
+    config_path = tmp_path / "switchyard.toml"
+    config_path.write_text(
+        'algorithm = "composite"\n'
+        "[classifier]\n"
+        'judge_model = "switchyard-judge"\n'
+        "base_threshold = 0.5\n"
+        "threshold_step = 0.1\n"
+        "max_output_tokens = 512\n"
+        "[stage]\n"
+        'picker = "efficient_first"\n'
+        "confidence_threshold = 0.5\n"
+        "recent_window = 6\n"
+    )
+    plugin = load_routing_plugin(config_path)
+    assert isinstance(plugin, CompositeRoutingPlugin)
+    assert isinstance(plugin._classifier, ClassifierRoutingPlugin)
+    assert isinstance(plugin._stage, StageRoutingPlugin)
+    assert plugin._classifier._judge_model == "switchyard-judge"
+    assert plugin._stage._picker == "efficient_first"
+    assert plugin._stage._recent_window == 6
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        (
+            'algorithm = "composite"\n[classifier]\njudge_model = "j"\nbase_threshold = 0.5\n',
+            "stage must be a table",
+        ),
+        (
+            'algorithm = "composite"\n[stage]\npicker = "efficient_first"\n'
+            "confidence_threshold = 0.5\n",
+            "classifier must be a table",
+        ),
+        ('algorithm = "composite"\nseed = 1\n[classifier]\n[stage]\n', "unknown keys: seed"),
+        (
+            'algorithm = "composite"\n[classifier]\nalgorithm = "llm_classifier"\n'
+            'judge_model = "j"\nbase_threshold = 0.5\n[stage]\npicker = "efficient_first"\n'
+            "confidence_threshold = 0.5\n",
+            "classifier.algorithm is implied",
+        ),
+        (
+            'algorithm = "composite"\n[classifier]\njudge_model = "j"\nbase_threshold = 0.5\n'
+            '[stage]\npicker = "sideways"\nconfidence_threshold = 0.5\n',
+            "picker must be",
+        ),
+    ],
+)
+def test_rejects_invalid_composite_configuration(tmp_path: Path, config: str, message: str) -> None:
+    config_path = tmp_path / "switchyard.toml"
+    config_path.write_text(config)
+    with pytest.raises(ValueError, match=message):
+        load_routing_plugin(config_path)

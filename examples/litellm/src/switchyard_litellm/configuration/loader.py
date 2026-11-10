@@ -14,15 +14,19 @@ import os
 import tomllib
 from collections.abc import Collection, Mapping
 from pathlib import Path
+from typing import cast
 
 from switchyard_litellm.plugins import (
     ClassifierRoutingPlugin,
+    CompositeRoutingPlugin,
     LiteLLMJudge,
     RandomRoutingPlugin,
     StageRoutingPlugin,
 )
 
-RoutingPlugin = ClassifierRoutingPlugin | RandomRoutingPlugin | StageRoutingPlugin
+RoutingPlugin = (
+    ClassifierRoutingPlugin | CompositeRoutingPlugin | RandomRoutingPlugin | StageRoutingPlugin
+)
 
 CONFIG_ENV = "SWITCHYARD_LITELLM_CONFIG"
 _STAGE_KEYS = frozenset(
@@ -52,11 +56,12 @@ _CLASSIFIER_KEYS = frozenset(
         "judge_timeout_seconds",
     }
 )
+_COMPOSITE_KEYS = frozenset({"algorithm", "classifier", "stage"})
 _MAX_RANDOM_SEED = (1 << 64) - 1
 
 
 def load_routing_plugin(path: str | Path) -> RoutingPlugin:
-    """Load a Stage or Random routing plugin from TOML."""
+    """Load a Stage, Random, classifier or composite routing plugin from TOML."""
     config_path = Path(path)
     try:
         with config_path.open("rb") as config_file:
@@ -73,6 +78,8 @@ def load_routing_plugin(path: str | Path) -> RoutingPlugin:
         return _random_plugin(values, config_path)
     if algorithm == "llm_classifier":
         return _classifier_plugin(values, config_path)
+    if algorithm == "composite":
+        return _composite_plugin(values, config_path)
     raise ValueError(
         f"Switchyard routing config {config_path} has unsupported algorithm {algorithm!r}"
     )
@@ -189,6 +196,31 @@ def _classifier_plugin(values: Mapping[str, object], config_path: Path) -> Class
         max_output_tokens=max_output_tokens if max_output_tokens is not None else 4096,
         response_format_type=response_format_type or "json_schema",
     )
+
+
+def _composite_plugin(values: Mapping[str, object], config_path: Path) -> CompositeRoutingPlugin:
+    """Validate the two tables of a composite profile and construct both plugins.
+
+    ``[classifier]`` takes the classifier's fields and ``[stage]`` takes Stage's, each
+    without its own ``algorithm`` key; the composite picks between them per request.
+    """
+    _reject_unknown_keys(values, _COMPOSITE_KEYS, config_path)
+    tables: dict[str, Mapping[str, object]] = {}
+    for name in ("classifier", "stage"):
+        table = values.get(name)
+        if not isinstance(table, Mapping):
+            raise ValueError(f"Switchyard routing config {config_path} {name} must be a table")
+        if "algorithm" in table:
+            raise ValueError(
+                f"Switchyard routing config {config_path} {name}.algorithm is implied by "
+                "the composite and must be omitted"
+            )
+        tables[name] = cast(Mapping[str, object], table)
+    classifier = _classifier_plugin(
+        {"algorithm": "llm_classifier", **tables["classifier"]}, config_path
+    )
+    stage = _stage_plugin({"algorithm": "stage", **tables["stage"]}, config_path)
+    return CompositeRoutingPlugin(classifier=classifier, stage=stage)
 
 
 def _required_unit_number(values: Mapping[str, object], key: str, config_path: Path) -> float:
