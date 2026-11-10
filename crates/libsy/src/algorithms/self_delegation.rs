@@ -111,6 +111,10 @@ pub struct SelfDelegationConfig {
     /// Send a context-compaction request (the client asking for a summary of its own
     /// history) to the capable target without asking the student. Needs a capable target.
     pub delegate_compaction: bool,
+    /// Send a local step to the capable target when it is identical (same text, same tool
+    /// calls) to one of the student's last N steps in the request history. 0 turns the check
+    /// off. Needs a capable target.
+    pub escalate_repeated_step: usize,
     /// Append one JSON object per decision to this file.
     pub trace_jsonl: Option<PathBuf>,
 }
@@ -125,6 +129,7 @@ impl Default for SelfDelegationConfig {
             collection_note: None,
             coalesce_assistant_turns: false,
             delegate_compaction: false,
+            escalate_repeated_step: 0,
             trace_jsonl: None,
         }
     }
@@ -188,6 +193,69 @@ pub fn is_summary_request(request: &Request) -> bool {
             .rev()
             .find(|message| message.role == Role::User)
             .is_some_and(|message| any_text_contains(&message.content, CLAUDE_SUMMARY_PROMPT))
+}
+
+/// A step as compared for repeats: the visible text without its route line, and each tool
+/// call's name and arguments.
+type Step = (String, Vec<(String, String)>);
+
+fn canonical_arguments(arguments: &Value) -> String {
+    match arguments {
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .map_or_else(|_| text.trim().to_string(), |value| value.to_string()),
+        other => other.to_string(),
+    }
+}
+
+fn reply_step(text: &str, tool_calls: &[Value]) -> Step {
+    let calls = tool_calls
+        .iter()
+        .map(|call| {
+            let function = &call["function"];
+            (
+                function["name"].as_str().unwrap_or_default().to_string(),
+                canonical_arguments(&function["arguments"]),
+            )
+        })
+        .collect();
+    (strip_route_line(text).0.trim().to_string(), calls)
+}
+
+fn message_step(message: &Message) -> Step {
+    let mut text = String::new();
+    let mut calls = Vec::new();
+    for block in &message.content {
+        match block {
+            ContentBlock::Text { text: part } => text.push_str(part),
+            ContentBlock::ToolCall(call) => {
+                calls.push((call.name.clone(), canonical_arguments(&call.arguments)));
+            }
+            _ => {}
+        }
+    }
+    (strip_route_line(&text).0.trim().to_string(), calls)
+}
+
+/// True when a reply with tool calls is identical, text and tool calls, to one of the last
+/// `window` assistant steps of the request: the student is repeating itself. A reply without
+/// tool calls ends the client's turn and is never a loop.
+pub fn repeats_recent_step(
+    request: &LlmRequest,
+    text: &str,
+    tool_calls: &[Value],
+    window: usize,
+) -> bool {
+    if window == 0 || tool_calls.is_empty() {
+        return false;
+    }
+    let step = reply_step(text, tool_calls);
+    request
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == Role::Assistant)
+        .take(window)
+        .any(|message| message_step(message) == step)
 }
 
 /// What the gateway does with a student reply.
@@ -964,12 +1032,30 @@ impl Algorithm for SelfDelegation {
             }
         }
 
-        let decision = if collecting {
+        let mut decision = if collecting {
             collection_label.unwrap_or("invalid")
         } else {
             classification.map_or("invalid", Classification::decision)
         };
+        // A local step the student already took: it is looping, so the capable model takes
+        // the turn. The teacher never loops in the SFT data, so the student has no way to
+        // ask for help here.
+        let repeated = capable.is_some()
+            && student_error.is_none()
+            && classification == Some(Classification::Local)
+            && attempts.last().is_some_and(|attempt| {
+                repeats_recent_step(
+                    &neutral.llm_request,
+                    &attempt.content,
+                    &attempt.tool_calls,
+                    self.config.escalate_repeated_step,
+                )
+            });
+        if repeated {
+            decision = "repeat";
+        }
         let (escalate, fallback) = match (&student_error, classification) {
+            _ if repeated => (true, true),
             (Some(_), _) => (
                 self.config.on_student_error == StudentErrorAction::Escalate,
                 true,
@@ -1073,7 +1159,7 @@ impl Algorithm for SelfDelegation {
         self.trace(&driver, &record);
         let mut evidence = json!({"source": "self_delegation", "verdict": decision});
         if fallback {
-            evidence["trigger"] = json!("fallback");
+            evidence["trigger"] = json!(if repeated { "repeat" } else { "fallback" });
         }
         driver.set_evidence(evidence);
         tracing::info!(

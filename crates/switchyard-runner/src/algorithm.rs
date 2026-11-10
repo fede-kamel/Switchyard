@@ -536,6 +536,11 @@ pub enum AlgorithmSpec {
         /// without `capable_target`.
         #[serde(default)]
         delegate_compaction: bool,
+        /// Sends a local step to the capable target when it is identical to one of the
+        /// efficient target's last N steps in the request history. 0 (the default) turns the
+        /// check off. Rejected without `capable_target`.
+        #[serde(default)]
+        escalate_repeated_step: usize,
     },
     Vgr {
         #[serde(flatten)]
@@ -2085,6 +2090,7 @@ fn build_algorithm(
             collection_note,
             coalesce_assistant_turns,
             delegate_compaction,
+            escalate_repeated_step,
         } => {
             resolve_target_model_id(route_name, efficient_target, targets)?;
             if let Some(capable_target) = capable_target {
@@ -2113,6 +2119,11 @@ fn build_algorithm(
                         "self_delegation route {route_name}: delegate_compaction requires capable_target"
                     )));
                 }
+                if *escalate_repeated_step > 0 {
+                    return Err(AlgorithmConfigError::new(format!(
+                        "self_delegation route {route_name}: escalate_repeated_step requires capable_target"
+                    )));
+                }
             }
             Ok(Arc::new(SelfDelegation::new(SelfDelegationConfig {
                 hide_route: *hide_route,
@@ -2122,6 +2133,7 @@ fn build_algorithm(
                 collection_note: collection_note.clone(),
                 coalesce_assistant_turns: *coalesce_assistant_turns,
                 delegate_compaction: *delegate_compaction,
+                escalate_repeated_step: *escalate_repeated_step,
                 trace_jsonl: trace_jsonl.clone(),
             })))
         }
@@ -2573,6 +2585,19 @@ mod tests {
         )
         .expect("route parses");
         assert!(spec.build("edgewise", &self_delegation_targets()).is_ok());
+
+        let spec: AlgorithmSpec = toml::from_str(
+            "type = \"self_delegation\"\nefficient_target = \"student\"\nescalate_repeated_step = 8",
+        )
+        .expect("route parses");
+        let error = match spec.build("edgewise", &self_delegation_targets()) {
+            Ok(_) => panic!("escalate_repeated_step must be rejected without capable_target"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("escalate_repeated_step requires capable_target"),
+            "{error}"
+        );
     }
 
     #[test]

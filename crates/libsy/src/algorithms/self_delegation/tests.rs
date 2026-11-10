@@ -585,6 +585,152 @@ async fn upstream_calls_are_buffered_and_a_streaming_client_gets_a_stream() -> R
     Ok(())
 }
 
+fn request_after_step(step_text: &str) -> Request {
+    let mut request = request();
+    request.llm_request.messages.push(Message {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::Text {
+                text: step_text.to_string(),
+            },
+            ContentBlock::ToolCall(ToolCall {
+                id: "call_0".to_string(),
+                name: "bash".to_string(),
+                arguments: json!({"cmd": "ls"}),
+            }),
+        ],
+    });
+    request.llm_request.messages.push(Message {
+        role: Role::Tool,
+        content: vec![ContentBlock::ToolResult(ToolResult {
+            tool_call_id: "call_0".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "ok".to_string(),
+            }],
+            is_error: None,
+        })],
+    });
+    request
+}
+
+#[tokio::test]
+async fn a_repeated_local_step_goes_to_the_capable_target() -> Result<()> {
+    let trace = TraceFile::new("repeat");
+    let step = "{\"route\":\"local\"}\nListing the files.";
+    let fake = Fake::new(
+        vec![Ok(reply(step, 1))],
+        vec![Ok(reply("Reading the parser instead.", 1))],
+    );
+    let config = SelfDelegationConfig {
+        escalate_repeated_step: 4,
+        ..trace.config()
+    };
+
+    let (selected, agg) = drive(config, request_after_step(step), models(true), &fake).await?;
+
+    assert_eq!(selected, STRONG);
+    assert_eq!(
+        fake.targets(),
+        vec![STUDENT.to_string(), STRONG.to_string()]
+    );
+    assert_eq!(
+        completion_text(&agg),
+        "{\"route\":\"cloud\"}\nReading the parser instead."
+    );
+    let record = trace.record();
+    assert_eq!(record["decision"], "repeat");
+    assert_eq!(record["strong"]["fallback"], true);
+    assert_eq!(record["served"]["by"], "strong");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_new_step_or_a_disabled_check_is_served_from_the_student() -> Result<()> {
+    let step = "{\"route\":\"local\"}\nListing the files.";
+    // Off by default.
+    let fake = Fake::new(vec![Ok(reply(step, 1))], vec![]);
+    let (selected, _) = drive(
+        SelfDelegationConfig::default(),
+        request_after_step(step),
+        models(true),
+        &fake,
+    )
+    .await?;
+    assert_eq!(selected, STUDENT);
+
+    // Same tool call, different text: a new step.
+    let config = SelfDelegationConfig {
+        escalate_repeated_step: 4,
+        ..SelfDelegationConfig::default()
+    };
+    let fake = Fake::new(vec![Ok(reply(step, 1))], vec![]);
+    let (selected, _) = drive(
+        config.clone(),
+        request_after_step("{\"route\":\"local\"}\nChecking the layout first."),
+        models(true),
+        &fake,
+    )
+    .await?;
+    assert_eq!(selected, STUDENT);
+
+    // The history step sits outside the window.
+    let mut far = request_after_step(step);
+    for index in 0..4 {
+        far.llm_request.messages.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: format!("{{\"route\":\"local\"}}\nOther step {index}."),
+            }],
+        });
+    }
+    let fake = Fake::new(vec![Ok(reply(step, 1))], vec![]);
+    let (selected, _) = drive(config, far, models(true), &fake).await?;
+    assert_eq!(selected, STUDENT);
+    Ok(())
+}
+
+#[test]
+fn repeat_detection_ignores_argument_formatting_and_text_only_replies() {
+    let request = request_after_step("{\"route\":\"local\"}\nListing the files.").llm_request;
+    let call = |arguments: &str| {
+        vec![
+            json!({"id": "c", "type": "function", "function": {"name": "bash", "arguments": arguments}}),
+        ]
+    };
+    let text = "{\"route\":\"local\"}\nListing the files.";
+    assert!(repeats_recent_step(
+        &request,
+        text,
+        &call("{\"cmd\":\"ls\"}"),
+        1
+    ));
+    assert!(repeats_recent_step(
+        &request,
+        text,
+        &call("{ \"cmd\": \"ls\" }"),
+        1
+    ));
+    assert!(repeats_recent_step(
+        &request,
+        "Listing the files.",
+        &call("{\"cmd\":\"ls\"}"),
+        1
+    ));
+    assert!(!repeats_recent_step(
+        &request,
+        text,
+        &call("{\"cmd\":\"ls -la\"}"),
+        1
+    ));
+    assert!(!repeats_recent_step(&request, text, &[], 1));
+    assert!(!repeats_recent_step(
+        &request,
+        text,
+        &call("{\"cmd\":\"ls\"}"),
+        0
+    ));
+}
+
 fn summary_request_by_header() -> Request {
     let mut request = request();
     let mut headers = http::HeaderMap::new();

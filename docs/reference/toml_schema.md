@@ -662,6 +662,7 @@ reply is asked again unless it carries a route line and a step. See
 | `collection_note` | No | unset | Collection mode only: text appended to each efficient-target request as its last user message, a per-reply reminder to start with the route line for a teacher that drops it on later turns. The trace never records it. Rejected at load when `capable_target` is set. |
 | `coalesce_assistant_turns` | No | `false` | Merges an assistant message with text and no tool calls into one message with the tool-call-only assistant messages that directly follow it, before the decision and the trace. Codex replays a step as a message item and function-call items, which arrive as two assistant messages; a model that produced the step as one message otherwise sees its history split. Preserved provider bodies are dropped when a merge happens. |
 | `delegate_compaction` | No | `false` | Sends a context-compaction request to the capable target without asking the efficient target and serves the summary without a route line. Rejected at load without `capable_target`. |
+| `escalate_repeated_step` | No | `0` | Loop breaker: a local step identical to one of the efficient target's last N steps in the request history is sent to the capable target (trace decision `repeat`). `0` is off. Rejected at load without `capable_target`. |
 
 ## Validation Errors
 
