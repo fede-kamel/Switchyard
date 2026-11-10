@@ -585,6 +585,103 @@ async fn upstream_calls_are_buffered_and_a_streaming_client_gets_a_stream() -> R
     Ok(())
 }
 
+fn summary_request_by_header() -> Request {
+    let mut request = request();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "x-claude-code-request-class",
+        http::HeaderValue::from_static("compaction"),
+    );
+    request
+        .metadata
+        .as_mut()
+        .expect("fixture metadata")
+        .http_headers = Some(headers);
+    request
+}
+
+#[tokio::test]
+async fn delegate_compaction_sends_a_summary_request_to_the_capable_target() -> Result<()> {
+    let trace = TraceFile::new("delegate_compaction");
+    let summary = "<summary>The parser fix is half done.</summary>";
+    let fake = Fake::new(vec![], vec![Ok(reply(summary, 0))]);
+    let config = SelfDelegationConfig {
+        delegate_compaction: true,
+        ..trace.config()
+    };
+
+    let (selected, agg) = drive(config, summary_request_by_header(), models(true), &fake).await?;
+
+    assert_eq!(selected, STRONG);
+    assert_eq!(fake.targets(), vec![STRONG.to_string()]);
+    assert_eq!(
+        completion_text(&agg),
+        summary,
+        "no route line is added to a summary"
+    );
+    let record = trace.record();
+    assert_eq!(record["decision"], "compaction");
+    assert_eq!(record["student"]["attempts"], json!([]));
+    assert_eq!(record["served"]["by"], "strong");
+    assert_eq!(record["strong"]["content"], summary);
+    Ok(())
+}
+
+#[tokio::test]
+async fn delegate_compaction_is_off_by_default_and_needs_a_capable_target() -> Result<()> {
+    let text = "{\"route\":\"local\"}\nSummary of the work so far.";
+    let fake = Fake::new(vec![Ok(reply(text, 0))], vec![]);
+    let (selected, _) = drive(
+        SelfDelegationConfig::default(),
+        summary_request_by_header(),
+        models(true),
+        &fake,
+    )
+    .await?;
+    assert_eq!(selected, STUDENT);
+
+    let fake = Fake::new(vec![Ok(reply(text, 0))], vec![]);
+    let config = SelfDelegationConfig {
+        delegate_compaction: true,
+        ..SelfDelegationConfig::default()
+    };
+    let (selected, _) = drive(config, summary_request_by_header(), models(false), &fake).await?;
+    assert_eq!(selected, STUDENT);
+    Ok(())
+}
+
+#[test]
+fn summary_requests_are_recognized_by_prompt_and_ordinary_turns_are_not() {
+    assert!(!is_summary_request(&request()));
+    assert!(is_summary_request(&summary_request_by_header()));
+
+    let mut by_system = request();
+    by_system.llm_request.instructions = vec![InstructionBlock {
+        role: Role::System,
+        content: vec![ContentBlock::Text {
+            text: "You are a helpful AI assistant tasked with summarizing conversations."
+                .to_string(),
+        }],
+    }];
+    assert!(is_summary_request(&by_system));
+
+    let mut by_prompt = request();
+    by_prompt.llm_request.messages.push(Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "Your task is to create a detailed summary of the conversation so far."
+                .to_string(),
+        }],
+    });
+    assert!(is_summary_request(&by_prompt));
+
+    // A turn that continues from a summary is not a summary request.
+    let mut continued = request();
+    continued.llm_request.is_compaction = true;
+    continued.llm_request.has_compaction = true;
+    assert!(!is_summary_request(&continued));
+}
+
 #[tokio::test]
 async fn compaction_flags_are_recorded_and_the_reply_is_served_unchanged() -> Result<()> {
     let trace = TraceFile::new("compaction");

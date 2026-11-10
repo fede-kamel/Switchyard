@@ -34,5 +34,8 @@ capable_target = "strong"
 trace_jsonl = "/var/tmp/edgewise-serve-trace.jsonl"
 # Codex replays a step as a text item and function-call items; merge them back into one message.
 coalesce_assistant_turns = true
+# A context-compaction request (the client asking for a summary of its own history) goes to the
+# capable model without a student call; the student is not trained on summarization.
+delegate_compaction = true
 on_invalid = { retry = 1, action = "serve" }
 on_student_error = "error"

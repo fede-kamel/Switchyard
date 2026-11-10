@@ -531,6 +531,11 @@ pub enum AlgorithmSpec {
         /// follow it, the shape some clients replay a step in, before the decision.
         #[serde(default)]
         coalesce_assistant_turns: bool,
+        /// Sends a context-compaction request (the client asking for a summary of its own
+        /// history) to the capable target without asking the efficient target. Rejected
+        /// without `capable_target`.
+        #[serde(default)]
+        delegate_compaction: bool,
     },
     Vgr {
         #[serde(flatten)]
@@ -2079,6 +2084,7 @@ fn build_algorithm(
             on_student_error,
             collection_note,
             coalesce_assistant_turns,
+            delegate_compaction,
         } => {
             resolve_target_model_id(route_name, efficient_target, targets)?;
             if let Some(capable_target) = capable_target {
@@ -2102,6 +2108,11 @@ fn build_algorithm(
                         "self_delegation route {route_name}: on_student_error = \"escalate\" requires capable_target"
                     )));
                 }
+                if *delegate_compaction {
+                    return Err(AlgorithmConfigError::new(format!(
+                        "self_delegation route {route_name}: delegate_compaction requires capable_target"
+                    )));
+                }
             }
             Ok(Arc::new(SelfDelegation::new(SelfDelegationConfig {
                 hide_route: *hide_route,
@@ -2110,6 +2121,7 @@ fn build_algorithm(
                 on_student_error: *on_student_error,
                 collection_note: collection_note.clone(),
                 coalesce_assistant_turns: *coalesce_assistant_turns,
+                delegate_compaction: *delegate_compaction,
                 trace_jsonl: trace_jsonl.clone(),
             })))
         }
@@ -2539,6 +2551,28 @@ mod tests {
             [ModelId::from("student")]
         );
         Ok(())
+    }
+
+    #[test]
+    fn self_delegation_delegate_compaction_requires_a_capable_target() {
+        let spec: AlgorithmSpec = toml::from_str(
+            "type = \"self_delegation\"\nefficient_target = \"student\"\ndelegate_compaction = true",
+        )
+        .expect("route parses");
+        let error = match spec.build("edgewise", &self_delegation_targets()) {
+            Ok(_) => panic!("delegate_compaction must be rejected without capable_target"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("delegate_compaction requires capable_target"),
+            "{error}"
+        );
+        let spec: AlgorithmSpec = toml::from_str(
+            "type = \"self_delegation\"\nefficient_target = \"student\"\n\
+             capable_target = \"strong\"\ndelegate_compaction = true",
+        )
+        .expect("route parses");
+        assert!(spec.build("edgewise", &self_delegation_targets()).is_ok());
     }
 
     #[test]

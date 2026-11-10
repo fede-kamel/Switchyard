@@ -108,6 +108,9 @@ pub struct SelfDelegationConfig {
     /// it before anything else happens, so a history a client replays as separate items reads
     /// as one message per step.
     pub coalesce_assistant_turns: bool,
+    /// Send a context-compaction request (the client asking for a summary of its own
+    /// history) to the capable target without asking the student. Needs a capable target.
+    pub delegate_compaction: bool,
     /// Append one JSON object per decision to this file.
     pub trace_jsonl: Option<PathBuf>,
 }
@@ -121,6 +124,7 @@ impl Default for SelfDelegationConfig {
             on_student_error: StudentErrorAction::Error,
             collection_note: None,
             coalesce_assistant_turns: false,
+            delegate_compaction: false,
             trace_jsonl: None,
         }
     }
@@ -138,6 +142,52 @@ impl SelfDelegation {
         let trace = config.trace_jsonl.clone().map(TraceWriter::new);
         Self { config, trace }
     }
+}
+
+const CLAUDE_REQUEST_CLASS_HEADER: &str = "x-claude-code-request-class";
+const CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
+const CLAUDE_SUMMARY_SYSTEM: &str = "tasked with summarizing conversations";
+const CLAUDE_SUMMARY_PROMPT: &str = "your task is to create a detailed summary of";
+
+fn any_text_contains(blocks: &[ContentBlock], needle: &str) -> bool {
+    blocks.iter().any(|block| {
+        matches!(block, ContentBlock::Text { text } if text.to_ascii_lowercase().contains(needle))
+    })
+}
+
+/// True when the client asks for a summary of its own history (context compaction): Claude
+/// Code's `compaction` request class (sent with `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`) or its
+/// summarizer prompts, or Codex's `compaction` request kind. This is the summary request
+/// itself, not the turn that continues from a summary (`LlmRequest::is_compaction`).
+pub fn is_summary_request(request: &Request) -> bool {
+    if let Some(headers) = request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.http_headers.as_ref())
+    {
+        let claude = headers
+            .get(CLAUDE_REQUEST_CLASS_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("compaction"));
+        let codex = headers
+            .get(CODEX_TURN_METADATA_HEADER)
+            .and_then(|value| serde_json::from_slice::<Value>(value.as_bytes()).ok())
+            .is_some_and(|metadata| metadata["request_kind"] == "compaction");
+        if claude || codex {
+            return true;
+        }
+    }
+    let llm_request = &request.llm_request;
+    llm_request
+        .instructions
+        .iter()
+        .any(|block| any_text_contains(&block.content, CLAUDE_SUMMARY_SYSTEM))
+        || llm_request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User)
+            .is_some_and(|message| any_text_contains(&message.content, CLAUDE_SUMMARY_PROMPT))
 }
 
 /// What the gateway does with a student reply.
@@ -701,6 +751,79 @@ impl SelfDelegation {
         }
     }
 
+    /// Serves a context-compaction request from the capable target: no student call, no
+    /// route line. The summary becomes the client's new history, so it is passed through
+    /// as the capable model wrote it.
+    async fn serve_compaction(
+        &self,
+        driver: &Driver,
+        neutral: Request,
+        upstream: Request,
+        efficient: &ModelId,
+        capable_target: &ModelId,
+        streaming: bool,
+    ) -> Result<RoutingOutcome> {
+        let started = Instant::now();
+        let mut strong = StrongRecord {
+            target: capable_target.clone(),
+            content: String::new(),
+            tool_calls: Vec::new(),
+            finish_reason: Value::Null,
+            usage: Usage::default(),
+            latency_ms: 0,
+            imitated_route_line: false,
+            fallback: false,
+            error: None,
+        };
+        let mut record = Decision {
+            neutral: &neutral,
+            upstream: &upstream.llm_request,
+            efficient,
+            capable: Some(capable_target),
+            attempts: &[],
+            decision: "compaction",
+            strong: None,
+            served: None,
+        };
+        let buffered = match call_buffered(driver, upstream.clone(), capable_target).await {
+            Ok(buffered) => buffered,
+            Err(error) => {
+                tracing::warn!(target = %capable_target, %error, "self_delegation compaction call failed");
+                strong.latency_ms = started.elapsed().as_millis();
+                strong.error = Some(error.to_string());
+                record.strong = Some(&strong);
+                self.trace(driver, &record);
+                return Err(error);
+            }
+        };
+        strong.latency_ms = started.elapsed().as_millis();
+        let (text, tool_calls) = text_and_tools(&buffered.agg);
+        strong.content = text.clone();
+        strong.finish_reason = finish_reason(&buffered.agg);
+        strong.usage = buffered.agg.usage.clone();
+        let served = Served {
+            by: "strong",
+            content: text,
+            tool_calls: tool_calls.len(),
+            stripped_route_line: false,
+        };
+        strong.tool_calls = tool_calls;
+        record.strong = Some(&strong);
+        record.served = Some(&served);
+        self.trace(driver, &record);
+        driver.set_evidence(json!({
+            "source": "self_delegation",
+            "verdict": "compaction",
+            "trigger": "compaction",
+        }));
+        tracing::info!(target = %capable_target, "self_delegation served a compaction request from the capable model");
+        Ok(RoutingOutcome::answered(
+            capable_target.clone(),
+            neutral,
+            buffered.into_response(streaming),
+        ))
+    }
+
     fn trace(&self, driver: &Driver, decision: &Decision<'_>) {
         let Some(trace) = &self.trace else {
             return;
@@ -758,6 +881,22 @@ impl Algorithm for SelfDelegation {
         }
         let mut upstream = neutral.clone();
         clear_stream(&mut upstream.llm_request);
+
+        if self.config.delegate_compaction
+            && let Some(capable_target) = capable.as_ref()
+            && is_summary_request(&neutral)
+        {
+            return self
+                .serve_compaction(
+                    &driver,
+                    neutral,
+                    upstream,
+                    &efficient,
+                    capable_target,
+                    streaming,
+                )
+                .await;
+        }
 
         let mut attempts = Vec::new();
         let mut student: Option<Buffered> = None;
